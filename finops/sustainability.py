@@ -41,6 +41,23 @@ def energy_cost_usd(wh: float, region: str = "us-east-1") -> float:
     return (wh / 1000.0) * REGION_PRICE_KWH.get(region, 0.12)
 
 
+def region_table(kwh: float, carbon_price_usd_per_t: float = 100.0) -> list:
+    """Per-region electricity $, carbon and an internal-carbon-price blended score for `kwh`.
+
+    `blended_usd` = electricity $ + carbon_price x tonnes CO2 — one number to rank regions when
+    cost and carbon pull in different directions.
+    """
+    wh = kwh * 1000.0
+    rows = []
+    for region in REGION_CARBON:
+        usd = energy_cost_usd(wh, region)
+        co2_g = carbon_g(wh, region)
+        rows.append({"region": region, "usd_per_kwh": REGION_PRICE_KWH[region],
+                     "g_per_kwh": REGION_CARBON[region], "energy_usd": usd, "carbon_g": co2_g,
+                     "blended_usd": usd + co2_g / 1e6 * carbon_price_usd_per_t})
+    return rows
+
+
 def tokens_per_watt(total_tokens: int, wh: float, seconds: float = 1.0) -> float:
     """Energy efficiency of serving: tokens per watt (higher is better)."""
     watts = (wh * 3600.0) / seconds if seconds > 0 else 0.0

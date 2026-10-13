@@ -58,6 +58,61 @@ def flag_util_lies(rows, util_threshold: float = 0.90, mfu_threshold: float = 0.
     return out
 
 
+def dollars_per_gb_vram(on_demand_hr: float, hbm_gb: float) -> float:
+    """$/GB-VRAM-hour: what you pay per GB of model memory. 0 if hbm_gb<=0."""
+    return on_demand_hr / hbm_gb if hbm_gb > 0 else 0.0
+
+
+def recommend_rightsize(
+    current_type: str,
+    need_mem_gb: float,
+    need_bw_tbs: float,
+    need_tflops: float,
+    catalog: dict,
+    max_load: float = 0.70,
+    mem_headroom: float = 1.10,
+    max_mfu: float = 0.55,
+    allowed_types=None,
+) -> dict:
+    """Cheapest catalog GPU that still fits a workload's measured demand.
+
+    `need_*` are the workload's observed peaks (max memory, p95 bandwidth, p95 TFLOPs).
+    A candidate must satisfy ALL of:
+      - memory : hbm_gb >= need_mem_gb x mem_headroom      (weights + KV cache must fit)
+      - bandwidth: need_bw / peak_bw <= max_load           (decode is bandwidth-bound)
+      - compute: need_tflops / peak_tflops <= max_mfu     (MFU above ~0.55 is unreachable
+        in practice, so a card that would need it is too small even if "on paper" it fits)
+    `allowed_types` restricts candidates (e.g. same-vendor only: a cross-vendor move such as
+    NVIDIA -> AMD MI300X also costs a software port, which $/GPU-hr does not show).
+    Ranking is by $/GPU-hr among candidates that fit — the cheapest $/GPU-hr alone would
+    pick a card that cannot hold the model or starves the bandwidth.
+    `catalog` maps gpu_type -> dict with on_demand_hr, hbm_gb, peak_bw_tbs, peak_tflops_fp16.
+    """
+    def f(t, k):
+        return float(catalog[t][k])
+
+    fits = []
+    for t in catalog:
+        if allowed_types is not None and t not in allowed_types:
+            continue
+        if (f(t, "hbm_gb") >= need_mem_gb * mem_headroom
+                and need_bw_tbs / f(t, "peak_bw_tbs") <= max_load
+                and need_tflops / f(t, "peak_tflops_fp16") <= max_mfu):
+            fits.append(t)
+    # Current type may not even satisfy max_load (that's why we are looking) — it stays a fallback.
+    best = min(fits, key=lambda t: f(t, "on_demand_hr")) if fits else current_type
+    if f(best, "on_demand_hr") >= f(current_type, "on_demand_hr"):
+        best = current_type
+    cur_hr, new_hr = f(current_type, "on_demand_hr"), f(best, "on_demand_hr")
+    return {
+        "current": current_type, "recommended": best,
+        "current_hr": cur_hr, "recommended_hr": new_hr,
+        "savings_pct": round((1 - new_hr / cur_hr) * 100, 1) if cur_hr > 0 else 0.0,
+        "new_mbu": round(need_bw_tbs / f(best, "peak_bw_tbs"), 3),
+        "new_mfu": round(need_tflops / f(best, "peak_tflops_fp16"), 3),
+    }
+
+
 def idle_waste_usd(idle_hours: float, on_demand_hr: float) -> float:
     """Dollars burned by a GPU left running idle (training done, instance up)."""
     return max(0.0, idle_hours) * max(0.0, on_demand_hr)

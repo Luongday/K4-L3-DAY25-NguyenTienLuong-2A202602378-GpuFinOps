@@ -77,6 +77,110 @@ def recommend_tier(hours_per_day: float, interruptible: bool, reserved_discount:
     return "on_demand"
 
 
+# --- Extension 1: interruption-aware, duration-aware tier policy -------------------------
+# Illustrative per-hour spot reclaim probability by GPU type (assumption, not catalog data):
+# scarce/premium parts are reclaimed less often than small inference parts.
+INTERRUPTION_RATE_BY_GPU = {
+    "H100": 0.03, "H200": 0.03, "A100": 0.04, "B200": 0.05,
+    "MI300X": 0.06, "A10G": 0.08, "L4": 0.10,
+}
+# Commitment term in months; used to price stranded commitment when the service lives shorter.
+RESERVED_TERM_MONTHS = {"reserved_1yr": 12, "reserved_3yr": 36}
+# Lower number = lower lock-in. Used to break near-ties toward flexibility.
+_COMMITMENT_RANK = {"on_demand": 0, "spot": 1, "reserved_1yr": 2, "reserved_3yr": 3}
+
+
+def evaluate_tiers(
+    hours_per_day: float,
+    interruptible: bool,
+    on_demand_hr: float,
+    spot_hr: float,
+    reserved_1yr_hr: float,
+    reserved_3yr_hr: float,
+    gpu_type: str | None = None,
+    job_days: float = 30,
+    lifetime_months: float = 24,
+    days_per_month: int = 30,
+) -> dict:
+    """Monthly cost PER GPU of every feasible purchasing tier, with honest accounting.
+
+    - on_demand: pay only for used hours.
+    - spot: only if interruptible; includes checkpoint overhead + rework using the
+      GPU-specific interruption rate (not a flat 5%).
+    - reserved_*: a commitment bills every hour of the month (24h x days), used or not,
+      so it is only eligible for steady services (job_days >= days_per_month). If the
+      service is expected to live shorter than the term, the unused term is stranded:
+      cost is scaled by term / lifetime.
+    """
+    used_hours = max(0.0, hours_per_day) * days_per_month
+    options = {"on_demand": used_hours * on_demand_hr}
+    if interruptible and hours_per_day < 24:
+        rate = INTERRUPTION_RATE_BY_GPU.get(gpu_type or "", 0.05)
+        sim = spot_checkpoint_cost(used_hours, spot_hr, on_demand_hr, interrupt_rate=rate)
+        options["spot"] = sim["spot_cost"]
+    if job_days >= days_per_month:  # steady-state service -> commitment is plausible
+        full_month = 24.0 * days_per_month
+        for tier, rate in (("reserved_1yr", reserved_1yr_hr), ("reserved_3yr", reserved_3yr_hr)):
+            term = RESERVED_TERM_MONTHS[tier]
+            stranded = max(1.0, term / max(lifetime_months, 1e-9))
+            options[tier] = full_month * rate * stranded
+    return options
+
+
+def recommend_tier_v2(
+    hours_per_day: float,
+    interruptible: bool,
+    on_demand_hr: float,
+    spot_hr: float,
+    reserved_1yr_hr: float,
+    reserved_3yr_hr: float,
+    gpu_type: str | None = None,
+    job_days: float = 30,
+    lifetime_months: float = 24,
+    tie_tolerance: float = 0.01,
+) -> dict:
+    """Cost-minimizing tier. Among options within `tie_tolerance` of the cheapest, pick
+    the least-committed one (flexibility is free option value)."""
+    options = evaluate_tiers(hours_per_day, interruptible, on_demand_hr, spot_hr,
+                             reserved_1yr_hr, reserved_3yr_hr, gpu_type, job_days, lifetime_months)
+    cheapest = min(options.values())
+    near = [t for t, c in options.items() if c <= cheapest * (1.0 + tie_tolerance)]
+    tier = min(near, key=lambda t: _COMMITMENT_RANK[t])
+    return {"tier": tier, "monthly_cost_per_gpu": options[tier], "options": options}
+
+
+# --- Extension 3: is prompt caching actually worth it? ------------------------------------
+def cache_breakeven_reads(write_cost_per_m: float = 0.25, read_discount: float = 0.10) -> float:
+    """Reads of a cached prefix needed before caching beats not caching.
+
+    Per cached token, relative to base input price p:
+      without cache: p x (1 + n)                       (n re-reads, all full price)
+      with cache   : p x (1 + w) + p x n x d           (one write premium w, reads at d)
+    Saving = p x (n x (1 - d) - w)  ->  break-even n* = w / (1 - d).
+    """
+    saving_per_read = 1.0 - read_discount
+    if saving_per_read <= 0:
+        return float("inf")
+    return max(0.0, write_cost_per_m) / saving_per_read
+
+
+def cache_is_worth_it(avg_cache_reads: float, write_cost_per_m: float = 0.25,
+                      read_discount: float = 0.10) -> bool:
+    """True only if the average re-reads per cached prefix clear the break-even.
+
+    `write_cost_per_m` is the EXTRA write cost as a multiple of the base input price
+    (Anthropic 5-min write 1.25x -> 0.25; 1-hour TTL 2x -> 1.0; for storage-billed caches
+    such as Gemini, fold the hourly storage fee into this number).
+    """
+    return avg_cache_reads > cache_breakeven_reads(write_cost_per_m, read_discount)
+
+
+def cache_net_savings_per_m(avg_cache_reads: float, price_in_per_m: float,
+                            write_cost_per_m: float = 0.25, read_discount: float = 0.10) -> float:
+    """USD saved per 1M cached tokens over a prefix's life (negative = caching loses money)."""
+    return price_in_per_m * (avg_cache_reads * (1.0 - read_discount) - write_cost_per_m)
+
+
 def spot_checkpoint_cost(
     job_hours: float,
     spot_hr: float,
